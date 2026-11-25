@@ -1,0 +1,11 @@
+{
+  "name": "developable-unfold-prototype",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Ruled-surface developability solver, intrinsic unfolding, and papercraft tab layout prototype.",
+  "scripts": {
+    "test": "node --test test/geometry.test.js",
+    "serve": "node ui/serve.mjs"
+  }
+}
