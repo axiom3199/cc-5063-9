@@ -6,6 +6,14 @@ import { sub, cross, unit } from '../src/math.js';
 import { pairingDiagnostics } from '../src/correspondence.js';
 
 const $ = (id) => document.getElementById(id);
+// JSON-safe copy: non-finite numbers become explicit strings (e.g. "Infinity")
+// so a snapshot never silently reports a real coordinate failure as "unknown".
+function jsonSafe(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : String(v);
+  if (Array.isArray(v)) return v.map(jsonSafe);
+  if (v && typeof v === 'object') { const o = {}; for (const k of Object.keys(v)) o[k] = jsonSafe(v[k]); return o; }
+  return v;
+}
 const state = {
   presetKey: 'cylinder',
   params: null,
@@ -46,43 +54,37 @@ function recompute() {
   const dev = measureDevelopability(model, { nu: Math.max(60, state.nu * 2), angleTol: state.angleTol });
   const diag = diagnose(model, { nu: Math.max(80, state.nu * 2) });
 
-  // Restrict to the largest singular-free u-window. A strip that crosses a
-  // regression edge is not unfolded across it: either we emit the valid sub-range
-  // (located, the singular locus excluded) or, if none remains, we withhold output.
-  let uA = model.uMin, uB = model.uMax, clipped = false, clipNote = '', withheld = false;
-  if (diag.regressionEdge) {
-    if (diag.validURanges.length) {
-      const best = diag.validURanges.slice().sort((a, b) => (b[1] - b[0]) - (a[1] - a[0]))[0];
-      uA = best[0]; uB = best[1];
-      if (uA > model.uMin + 1e-6 || uB < model.uMax - 1e-6) {
-        clipped = true;
-        clipNote = `valid window u∈[${uA.toFixed(3)}, ${uB.toFixed(3)}] (singular locus excluded)`;
-      }
-    } else {
-      withheld = true;
-      uA = model.uMin; uB = model.uMin;
-    }
-  }
+  // The pipeline owns the degeneracy policy: unfold the requested span, and if a
+  // degenerate ruling makes the coordinates unplaceable it retreats to the largest
+  // singular-free window (and reports what it excluded). The UI never re-implements
+  // that (an earlier version did, ignoring collapsed rulings, and rendered distorted
+  // patterns). Non-developable strain is NOT clipped: it is measured and shown.
+  const piece = unfoldStrip(model, { nu: state.nu, nv: state.nv });
+  const flattenable = piece.ok;
+  const withheld = !piece.ok;
+  const uA = piece.uA, uB = piece.uB;
+  const clipped = piece.retreated;
+  const clipNote = piece.retreated
+    ? `valid window u∈[${uA.toFixed(3)}, ${uB.toFixed(3)}] (degenerate locus excluded)`
+    : '';
 
-  // Emit a flat pattern when the surface is flattenable on this window. We do NOT
-  // gate on the developability verdict: a non-developable strip is unfolded and
-  // its strain is measured and shown, never hidden.
-  const flattenable = !withheld && (uB - uA) > 0.05;
-  let piece = null, layout = null;
-  if (flattenable) {
-    piece = unfoldStrip(model, { nu: state.nu, nv: state.nv, uA, uB });
-    layout = planTabs(piece, [
-      { onSide: 'u0', nTabs: state.nTabs, priority: 1, label: 'seam-u0' },
-      { onSide: 'u1', nTabs: state.nTabs, priority: 1, label: 'seam-u1' },
-    ], { tabDepth: state.tabDepth });
-  }
+  const layout = flattenable
+    ? planTabs(piece, [
+        { onSide: 'u0', nTabs: state.nTabs, priority: 1, label: 'seam-u0' },
+        { onSide: 'u1', nTabs: state.nTabs, priority: 1, label: 'seam-u1' },
+      ], { tabDepth: state.tabDepth })
+    : null;
 
   let corrInfo = null;
   if (model.kind === 'direct' && model.cfg.curve0 && model.cfg.curve1) {
     corrInfo = pairingDiagnostics(model.cfg.curve0, model.cfg.curve1, { nu: 48 });
   }
 
-  state.result = { model, dev, diag, piece, layout, corrInfo, clipped, clipNote, uA, uB, flattenable, withheld, ms: performance.now() - tStart };
+  state.result = {
+    model, dev, diag, piece, layout, corrInfo, clipped, clipNote, uA, uB,
+    flattenable, withheld, failure: piece.failure, excluded: piece.excluded,
+    ms: performance.now() - tStart,
+  };
   renderStatus();
   renderLayout();
   drawAll();
@@ -99,6 +101,7 @@ function renderStatus() {
   let verdict;
   if (!dev.developable) verdict = pill('NOT DEVELOPABLE (measured)', 'bad');
   else if (diag.regressionEdge) verdict = pill('SINGULAR — regression edge', 'warn');
+  else if (diag.hasSingularity) verdict = pill('DEVELOPABLE, but has a degenerate ruling', 'warn');
   else verdict = pill('DEVELOPABLE (measured)', 'good');
   rows.push(`<div style="margin-bottom:6px">${verdict}</div>`);
   if (!dev.developable && diag.regressionEdge) {
@@ -128,15 +131,12 @@ function renderStatus() {
   if (diag.regressionEdge) {
     const re = diag.regressionEdge;
     rows.push(`<div style="margin-top:8px;color:var(--bad);font-size:11px">regression edge located: u∈[${re.uMin.toFixed(2)}, ${re.uMax.toFixed(2)}] at v≈${re.vActual.toFixed(3)}</div>`);
-    rows.push(`<div class="hint">${state.result.flattenable
-      ? 'singular locus located and excluded from the unfolded window'
-      : 'flat pattern withheld across the singular locus (located, not emitted)'}</div>`);
   } else if (diag.singular.length) {
     rows.push(`<div class="hint" style="color:var(--warn)">${diag.singular.length} singular sample(s) located</div>`);
   }
-  if (clipped) rows.push(`<div class="hint" style="color:var(--warn)">${clipNote}</div>`);
+  if (clipped) rows.push(`<div class="hint" style="color:var(--warn)">retreated: ${clipNote}</div>`);
 
-  if (piece) {
+  if (piece && piece.ok) {
     const e = piece.error;
     const ok = e.maxRel < 1e-5 && e.flips === 0;
     rows.push(`<div class="hd" style="margin-top:10px">Unfold error (correspondence-measured)</div>`);
@@ -149,9 +149,21 @@ function renderStatus() {
       <tr><td class="k">3D / 2D area</td><td>${e.areaTotal3.toFixed(3)} / ${e.areaTotal2.toFixed(3)}</td></tr>
     </table>`);
   } else {
-    rows.push(`<div style="margin-top:8px;color:var(--bad);font-size:11px">flat pattern not emitted — surface is singular on the requested region</div>`);
+    const why = piece ? failureText(state.result.failure) : 'no flattenable window';
+    rows.push(`<div style="margin-top:8px;color:var(--bad);font-size:11px">flat pattern withheld — ${why}</div>`);
+    rows.push(`<div class="hint">the degenerate region is located and reported; no distorted pattern is emitted in its place.</div>`);
   }
   $('status').innerHTML = rows.join('');
+}
+
+function failureText(f) {
+  return ({
+    'unplaced-vertices': 'a collapsed ruling left vertices with no finite 2D image',
+    'nonfinite-coordinates': 'non-finite coordinates from a degenerate ruling',
+    'folded-triangles': 'the strip would fold over itself (genuine strain / singularity)',
+    'nonfinite-error': 'the unfolded metric is undefined',
+    'strained': 'the unfolded metric is strained beyond tolerance',
+  })[f] || 'the request is not flattenable';
 }
 
 function renderLayout() {
@@ -287,11 +299,13 @@ function draw2d() {
   const { w, h, dpr } = fitCanvas(c2d);
   ctx2.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx2.clearRect(0, 0, w, h);
-  const { piece, layout } = state.result;
+  const { piece, layout, failure } = state.result;
 
-  if (!piece) {
+  if (!piece || !piece.ok) {
     ctx2.fillStyle = '#ef6b6b'; ctx2.font = '13px ui-monospace';
-    ctx2.fillText('flat pattern withheld: singular region located', 16, 30);
+    ctx2.fillText('flat pattern withheld — ' + failureText(failure), 16, 30);
+    ctx2.fillStyle = '#8b95a5'; ctx2.font = '11px ui-monospace';
+    ctx2.fillText('degenerate region located; no distorted coordinates emitted', 16, 50);
     return;
   }
 
@@ -395,15 +409,21 @@ $('btnTradeoff').addEventListener('click', () => {
 
 $('btnAB').addEventListener('click', () => {
   const model = currentModel();
+  // Each re-sliced half is a narrow sector; its two seam rulings are short and meet
+  // near the apex, so it packs one tab per seam cleanly (nTabsSplit=1). Demanding
+  // more per seam hits a genuine packing limit and confuses the A/B decision, which
+  // is about tab feasibility given similar unfold error, not about cramming tabs.
   let cmp;
   try {
-    cmp = compareTabFeasibility(model, { nu: state.nu, nv: state.nv, tabDepth: state.tabDepth, nTabs: state.nTabs, nTabsSplit: Math.max(1, state.nTabs - 1) });
+    cmp = compareTabFeasibility(model, { nu: state.nu, nv: state.nv, tabDepth: state.tabDepth, nTabs: state.nTabs, nTabsSplit: 1 });
   } catch (e) {
     $('abOut').innerHTML = `<pre style="white-space:pre-wrap;font-size:10.5px;color:var(--bad);margin:0">A/B comparison unavailable: ${e.message}</pre>`;
     return;
   }
   const wE = cmp.whole.error.rmsRel, sE = Math.max(cmp.split.A.error.rmsRel, cmp.split.B.error.rmsRel);
-  const sim = Math.abs(wE - sE) / Math.max(wE, sE || 1e-30) < 1e-3;
+  // machine-precision errors compare as "similar" on an absolute floor, matching
+  // compareTabFeasibility.errorsSimilar (a pure ratio would split round-off).
+  const sim = cmp.errorsSimilar;
   const orient = cmp.gluedPairs.map((g) => `${g.piece}:${g.edge}${g.orientation === 1 ? '↑out' : '↓IN'}`);
   const lines = [
     `whole: ${cmp.whole.layout.counts.tabs} tabs / ${cmp.whole.layout.counts.slits} slits  (rms err ${wE.toExponential(2)})`,
@@ -413,14 +433,18 @@ $('btnAB').addEventListener('click', () => {
     `locked fold: ${cmp.lockedFolds[0]?.label} (cut in flat pattern, glued back after assembly)`,
     cmp.splitFits && !cmp.wholeFits
       ? 'DECISION: re-slice — similar measured error, but only the split accommodates every tab.'
-      : 'DECISION: single piece is tab-feasible here; re-slicing is not required.',
+      : cmp.wholeFits && cmp.splitFits
+        ? 'DECISION: single piece is tab-feasible here; re-slicing is not required.'
+        : !cmp.wholeFits && !cmp.splitFits
+          ? 'DECISION: neither the whole nor the split accommodates every tab at this tab depth / count; retreat a cut to a slit or reduce tabs.'
+          : 'DECISION: the whole piece already fits; the split is not needed.',
   ];
   $('abOut').innerHTML = `<pre style="white-space:pre-wrap;font-size:10.5px;color:var(--muted);margin:0">${lines.join('\n')}</pre>`;
 });
 
 $('btnObj').addEventListener('click', () => {
-  const { model, piece } = state.result;
-  if (!piece) { log('OBJ export skipped: flat pattern withheld (singular region).'); return; }
+  const { model, piece, failure } = state.result;
+  if (!piece || !piece.ok) { log('OBJ export skipped: flat pattern withheld (' + failureText(failure) + ').'); return; }
   download(`developable-${state.presetKey}.obj`, exportOBJ(model, piece));
 });
 $('btnJson').addEventListener('click', () => {
@@ -479,16 +503,22 @@ window.__app = {
       singular: r.diag.singular.length,
       regressionEdge: r.diag.regressionEdge,
       flattenable: r.flattenable,
-      unfold: r.piece ? {
+      failure: r.failure || null,
+      retreated: !!r.clipped,
+      window: [r.uA, r.uB],
+      excluded: r.excluded || [],
+      unfold: r.piece && r.piece.ok ? {
         maxRel: r.piece.error.maxRel,
         rmsRel: r.piece.error.rmsRel,
         maxAngleDeg: r.piece.error.maxAngleDeg,
         areaRel: r.piece.error.areaRel,
         flips: r.piece.error.flips,
+        nonFinite2d: r.piece.error.nonFinite2d,
         area3: r.piece.error.areaTotal3,
         area2: r.piece.error.areaTotal2,
         polyArea: Math.abs(polygonArea(r.piece.outline.poly)),
-      } : null,
+        polyFinite: r.piece.outline.poly.every((p) => p.every(Number.isFinite)),
+      } : (r.piece ? { ok: false, failure: r.piece.failure, nonFinite2d: r.piece.error.nonFinite2d } : null),
       layout: r.layout ? {
         intended: r.layout.counts.intended,
         tabs: r.layout.counts.tabs,
@@ -496,7 +526,9 @@ window.__app = {
         coverage: r.layout.coverage,
         orientations: r.layout.tabs.map((t) => t.orientation),
       } : null,
-      pairing: r.corrInfo,
+      // jsonSafe: ill-conditioning is legitimately Infinity; keep it out of raw
+      // JSON so automated checks don't read Infinity as a coordinate failure.
+      pairing: r.corrInfo ? jsonSafe(r.corrInfo) : null,
     };
   },
 };

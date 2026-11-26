@@ -11,22 +11,87 @@ import { dist } from './math.js';
 // Unfold the strip for a given u-window [uA,uB].
 // Returns the 2D outline (closed polygon) plus per-outline-edge metadata marking
 // which edges are the uA / uB seam rulings.
+//
+// Degeneracy policy:
+//   * If the caller names a window (opts.uA/uB) we unfold exactly it; a caller that
+//     already retreated gets a straight answer, never a silent re-widening.
+//   * If the caller asks for the whole model we first probe; on a finite, fold-free
+//     result we keep it, otherwise we retreat to the largest singular-free u-window
+//     (from diagnose.validURanges) and unfold there, recording what was excluded.
+//     If no usable window remains we return a patch with ok=false and no faked coords.
 export function unfoldStrip(model, opts = {}) {
   const nu = opts.nu ?? model.cfg.nu ?? 64;
   const nv = opts.nv ?? model.cfg.nv ?? 6;
+  const explicit = opts.uA != null || opts.uB != null;
   const uA = opts.uA ?? model.uMin;
   const uB = opts.uB ?? model.uMax;
+
+  let patch = unfoldWindow(model, uA, uB, nu, nv, opts);
+  let retreated = false, excluded = [], diagInfo = null;
+  // Retreat ONLY to escape a coordinate/placement failure caused by a degenerate
+  // ruling (non-finite images the BFS could not place). We never retreat a merely
+  // non-developable surface: folding there is real strain and must stay visible,
+  // not be hidden by cropping to the largest "clean" window.
+  const coordinateFailure = patch.failure === 'unplaced-vertices' || patch.failure === 'nonfinite-coordinates';
+  if (!explicit && coordinateFailure) {
+    diagInfo = diagnose(model, { nu: Math.max(80, opts.diagNu ?? Math.max(nu, 120)) });
+    const win = chooseDevelopableWindow(diagInfo, opts.minSpan ?? 0.02);
+    if (win && (win[0] > model.uMin + 1e-9 || win[1] < model.uMax - 1e-9)) {
+      const trial = unfoldWindow(model, win[0], win[1], nu, nv, opts);
+      if (trial.ok) {
+        patch = trial;
+        retreated = true;
+        excluded = [{ start: model.uMin, end: win[0] }, { start: win[1], end: model.uMax }]
+          .filter((r) => r.end - r.start > 1e-9);
+      }
+    }
+  }
+  patch.retreated = retreated;
+  patch.excluded = excluded;
+  patch.diagWindow = retreated ? diagInfo : null;
+  return patch;
+}
+
+// The engine behind unfoldStrip for one fixed window. Never widens, never
+// fabricates: ok reflects that every vertex got a finite, fold-free image.
+function unfoldWindow(model, uA, uB, nu, nv, opts) {
   const sub = subModel(model, uA, uB);
   const mesh = sampleMesh(sub, nu, nv);
   const uf = unfoldMesh(mesh, { diagonal: opts.diagonal || 'main' });
   const err = measureUnfoldError(mesh, uf, opts);
   const outline = outlineOf(mesh, uf);
-  return { model: sub, mesh, unfold: uf, error: err, outline, topology: unfoldTopology(mesh, uf), uA, uB, nu, nv };
+  const ok = uf.ok && err.nonFinite2d === 0 && Number.isFinite(err.maxRel) && err.flips === 0;
+  return {
+    model: sub, mesh, unfold: uf, error: err, outline, topology: unfoldTopology(mesh, uf),
+    uA, uB, nu, nv, ok, failure: ok ? null : classifyFailure(uf, err),
+  };
 }
 
-// Restrict a model's u-range to [uA,uB] by reparametrising.
+function classifyFailure(uf, err) {
+  if (uf.nonFinite > 0) return 'unplaced-vertices';
+  if (err.nonFinite2d > 0) return 'nonfinite-coordinates';
+  if (err.flips > 0) return 'folded-triangles';
+  if (!Number.isFinite(err.maxRel)) return 'nonfinite-error';
+  if (err.maxRel >= 1e-4) return 'strained';
+  return null;
+}
+
+// Largest singular-free window, or null if none survives the minimum span.
+export function chooseDevelopableWindow(diagInfo, minSpan = 0.02) {
+  const usable = diagInfo.validURanges.filter((r) => r[1] - r[0] > minSpan);
+  if (!usable.length) return null;
+  return usable.slice().sort((a, b) => (b[1] - b[0]) - (a[1] - a[0]))[0];
+}
+
+// Restrict a model's u-range to [uA,uB] by reparametrising. u in [0,1] on the
+// returned model maps affinely onto [uA,uB] of the parent. The parent's own
+// uMin/uMax is the domain of uA/uB, NOT the sub-range (using it here would make
+// the retreat inert and re-emit the singular locus).
 export function subModel(model, uA, uB) {
-  const inner = (u) => model.uMin + (model.uMax - model.uMin) * u;
+  const lo = uA ?? model.uMin;
+  const hi = uB ?? model.uMax;
+  const span = hi - lo;
+  const inner = (u) => lo + span * u;
   const sub = {
     ...model,
     uMin: 0, uMax: 1,
@@ -39,9 +104,9 @@ export function subModel(model, uA, uB) {
     normal: (u, v) => model.normal(inner(u), v),
     _parent: model,
     _mapU: inner,
+    _uA: lo, _uB: hi,
   };
   // rescale derivatives with chain rule (du_inner/du = span)
-  const span = model.uMax - model.uMin;
   sub.dU = (u, v) => {
     const d = model.dU(inner(u), v);
     return [d[0] * span, d[1] * span, d[2] * span];
@@ -191,10 +256,22 @@ export function compareTabFeasibility(model, opts = {}) {
     split: { A: split.A, B: split.B, layoutA, layoutB, splitFrac: split.splitFrac },
     gluedPairs,
     lockedFolds,
-    errorsSimilar: Math.abs(whole.error.rmsRel - 0.5 * (split.A.error.rmsRel + split.B.error.rmsRel)) < (opts.similarTol ?? 1e-6),
+    // "similar error" must be robust when both errors are ~machine zero (a clean
+    // developable cone): a purely relative test would divide two round-off values
+    // and call them different. Compare on an absolute floor as well.
+    errorsSimilar: similarError(whole.error.rmsRel, 0.5 * (split.A.error.rmsRel + split.B.error.rmsRel), opts.similarTol ?? 1e-6),
     wholeFits: wholeLayout.tabs.length > 0 && wholeLayout.slits.length === 0,
     splitFits: layoutA.tabs.length > 0 && layoutB.tabs.length > 0 && layoutA.slits.length === 0 && layoutB.slits.length === 0,
   };
+}
+
+// Same-error test robust at machine zero: within tol both absolutely and (for
+// non-negligible errors) relatively.
+function similarError(a, b, tol) {
+  const absTol = tol * Math.max(1, a, b);
+  if (Math.abs(a - b) <= absTol) return true;
+  const denom = Math.max(a, b, 1e-30);
+  return Math.abs(a - b) / denom < tol;
 }
 
 function foldPolyline(outline, side) {

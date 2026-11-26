@@ -43,7 +43,14 @@ function edge3(mesh, a, b) {
 }
 
 // Flatten the triangulation intrinsically.
-// Returns { pos: Float64Array(2*nVerts), tri2d, metrics }.
+// Returns { pos, tri2d, metrics, ok, nonFinite, degenerateEdges }.
+//
+// Degenerate ruling policy: a ruling whose sampled edge length is ~0 (a collapsed
+// ruling, or a near-parallel pair closer than `tol`) carries no metric. We do NOT
+// invent a direction for it (the old code shoved the vertex to a neighbour + an
+// arbitrary 1e-3 offset, silently producing folded triangles that looked placed).
+// Such vertices are left NaN, counted, and `ok=false`. Callers either retreat to a
+// developable u-window (pipeline.unfoldStrip) or surface the failure.
 export function unfoldMesh(mesh, opts = {}) {
   const tri = triangulate(mesh, opts.diagonal || 'main');
   const { tris, nVerts, nu, nv } = tri;
@@ -54,6 +61,24 @@ export function unfoldMesh(mesh, opts = {}) {
   const P3 = new Array(nVerts);
   for (let i = 0; i <= nu; i++) for (let j = 0; j <= nv; j++) P3[tri.vid(i, j)] = mesh.rows[i][j];
   const len3 = (a, b) => dist(P3[a], P3[b]);
+
+  // characteristic length and the degeneracy threshold (relative, scale-free)
+  let charLen = 0;
+  for (const t of tris) for (let e = 0; e < 3; e++) charLen = Math.max(charLen, len3(t[e], t[(e + 1) % 3]));
+  const tol = 1e-9 * Math.max(1, charLen);
+  let degenerateEdges = 0;
+  const edgeDegenerate = new Map();
+  for (const t of tris) {
+    for (let e = 0; e < 3; e++) {
+      const a = t[e], b = t[(e + 1) % 3];
+      const k = a < b ? a + ':' + b : b + ':' + a;
+      if (!edgeDegenerate.has(k)) {
+        const deg = len3(a, b) < tol;
+        edgeDegenerate.set(k, deg);
+        if (deg) degenerateEdges++;
+      }
+    }
+  }
 
   // adjacency
   const edgeMap = new Map(); // "a:b" -> list of tri index
@@ -66,43 +91,51 @@ export function unfoldMesh(mesh, opts = {}) {
     }
   });
 
-  // seed triangle 0
-  const t0 = tris[0];
+  // seed: first triangle with a non-degenerate base edge and non-zero area
+  let seed = -1;
+  for (let ti = 0; ti < tris.length; ti++) {
+    const t = tris[ti];
+    if (len3(t[0], t[1]) >= tol && len3(t[0], t[2]) >= tol && len3(t[1], t[2]) >= tol) { seed = ti; break; }
+  }
+  if (seed < 0) {
+    // whole mesh is metric-degenerate: nothing can be placed soundly
+    return { ...tri, pos, placed, P3, ok: false, nonFinite: nVerts, degenerateEdges };
+  }
+  const t0 = tris[seed];
   placeSeed(t0);
-  let frontier = [0];
   const done = new Uint8Array(tris.length);
-  done[0] = 1;
+  done[seed] = 1;
+  const queue = [seed];
 
-  // BFS across shared edges. If a shared edge already has both endpoints placed,
-  // the new vertex may be determined redundantly (metric closure check).
-  const queue = [0];
+  const kOf = (a, b) => (a < b ? a + ':' + b : b + ':' + a);
+  // BFS across shared edges. We only cross an edge whose 3D length is non-degenerate:
+  // a collapsed ruling cannot determine the third vertex, so we leave it unresolved
+  // rather than fabricating a placement (which would fake a fold-free flattening).
   while (queue.length) {
     const ti = queue.shift();
     const t = tris[ti];
     for (let e = 0; e < 3; e++) {
       const a = t[e], b = t[(e + 1) % 3], c = t[(e + 2) % 3];
-      const k = a < b ? a + ':' + b : b + ':' + a;
+      const k = kOf(a, b);
+      if (edgeDegenerate.get(k)) continue;      // collapsed edge: no metric
       const nbrs = edgeMap.get(k);
       for (const tj of nbrs) {
         if (tj === ti || done[tj]) continue;
         const nt = tris[tj];
-        // third vertex of neighbour not on shared edge
         const nvtx = nt.find((x) => x !== a && x !== b);
         if (placed[c] && placed[nvtx] && placed[a] && placed[b]) { done[tj] = 1; queue.push(tj); continue; }
-        // ensure a,b placed
         if (!placed[a] || !placed[b]) continue;
         const lengthAC = len3(a, nvtx);
         const lengthBC = len3(b, nvtx);
+        if (lengthAC < tol || lengthBC < tol) continue;  // vertex coincides: undetermined
         const pa = get(pos, a), pb = get(pos, b);
         const cand = placeThird(pa, pb, lengthAC, lengthBC);
-        // choose the side opposite the existing third vertex c of ti
         const pc = get(pos, c);
         const sideRef = sideOf(pa, pb, pc);
         let chosen = cand[0];
         const s0 = sideOf(pa, pb, cand[0]);
         const s1 = sideOf(pa, pb, cand[1]);
         if (placed[c]) {
-          // keep on the opposite side from c (fold prevention)
           const opposite = -sideRef;
           chosen = Math.abs(s0 - opposite) <= Math.abs(s1 - opposite) ? cand[0] : cand[1];
         } else {
@@ -118,30 +151,31 @@ export function unfoldMesh(mesh, opts = {}) {
     }
   }
 
-  // fill any unplaced (isolated) vertices by local relaxation from placed neighbours
-  for (let k = 0; k < nVerts; k++) {
-    if (!placed[k]) {
-      // place at average of placed triangle neighbours using edge lengths
-      const [i, j] = [Math.floor(k / (nv + 1)), k % (nv + 1)];
-      const ans = [];
-      for (const [di, dj] of [[0, 1], [1, 0], [0, -1], [-1, 0]]) {
-        const ii = i + di, jj = j + dj;
-        if (ii < 0 || jj < 0 || ii > nu || jj > nv) continue;
-        const kk = tri.vid(ii, jj);
-        if (placed[kk]) ans.push(kk);
-      }
-      if (ans.length) {
-        const kk = ans[0];
-        const q = get(pos, kk);
-        set(pos, k, [q[0] + 1e-3, q[1]]);
+  // Local fallback for rulings the BFS could not cross because they collapsed.
+  // A collapsed u-column lies at a single 3D point, so every v along it must share
+  // one 2D image; copy it from the column's already-placed vertices. This is the
+  // exact image of a genuinely zero-length column, not an invented direction, so it
+  // cannot bend or scale the fabric. Vertices with no coincident placed neighbour
+  // stay NaN -> ok=false, and the caller retreats or reports failure.
+  for (let i = 0; i <= nu; i++) {
+    let anchorK = -1;
+    for (let j = 0; j <= nv; j++) { const k = tri.vid(i, j); if (placed[k]) { anchorK = k; break; } }
+    if (anchorK < 0) continue;
+    const anchorP = get(pos, anchorK);
+    for (let j = 0; j <= nv; j++) {
+      const k = tri.vid(i, j);
+      if (placed[k]) continue;
+      if (dist(mesh.rows[i][j], P3[anchorK]) < tol) {
+        set(pos, k, [anchorP[0], anchorP[1]]);
         placed[k] = 1;
-      } else {
-        set(pos, k, [0, 0]); placed[k] = 1;
       }
     }
   }
 
-  return { ...tri, pos, placed, P3 };
+  let nonFinite = 0;
+  for (let k = 0; k < nVerts; k++) if (!placed[k]) nonFinite++;
+
+  return { ...tri, pos, placed, P3, ok: nonFinite === 0, nonFinite, degenerateEdges };
 
   function placeSeed(t) {
     set(pos, t[0], [0, 0]);
@@ -187,15 +221,17 @@ export function measureUnfoldError(mesh, unfold, opts = {}) {
   const pos = unfold.pos;
   const get2 = (k) => [pos[2 * k], pos[2 * k + 1]];
   const rows = [];
-  let maxAbs = 0, maxRel = 0, sumRel2 = 0, n = 0;
+  let maxAbs = 0, maxRel = 0, sumRel2 = 0, n = 0, nFiniteFail = 0;
   const addErr = (kind, i, j, a, b) => {
     const l3 = dist(mesh.rows[a[0]][a[1]], mesh.rows[b[0]][b[1]]);
-    const l2 = Math.hypot(get2(vid(a[0], a[1]))[0] - get2(vid(b[0], b[1]))[0], get2(vid(a[0], a[1]))[1] - get2(vid(b[0], b[1]))[1]);
+    const qa = get2(vid(a[0], a[1])), qb = get2(vid(b[0], b[1]));
+    const finite2d = Number.isFinite(qa[0]) && Number.isFinite(qa[1]) && Number.isFinite(qb[0]) && Number.isFinite(qb[1]);
+    const l2 = finite2d ? Math.hypot(qa[0] - qb[0], qa[1] - qb[1]) : NaN;
     const abs = Math.abs(l2 - l3);
-    const rel = l3 > 1e-9 ? abs / l3 : 0;
-    rows.push({ kind, i, j, l3, l2, abs, rel });
+    const rel = finite2d ? (l3 > 1e-9 ? abs / l3 : 0) : Infinity;
+    rows.push({ kind, i, j, l3, l2, abs, rel, finite: finite2d });
     maxAbs = Math.max(maxAbs, abs); maxRel = Math.max(maxRel, rel);
-    sumRel2 += rel * rel; n++;
+    if (finite2d) { sumRel2 += rel * rel; n++; } else { nFiniteFail++; }
   };
   const vAfter = (j) => j / nv;
   for (let i = 0; i <= nu; i++) {
@@ -207,15 +243,23 @@ export function measureUnfoldError(mesh, unfold, opts = {}) {
   }
   const rmsRel = Math.sqrt(sumRel2 / Math.max(1, n));
 
+  // A non-finite 2D image means the flattening could not place that vertex. That
+  // is a hard failure, not a small residual: flag it and never let a NaN quietly
+  // satisfy "maxRel < tol".
+  let nonFinite2d = 0;
+  for (let k = 0; k < pos.length; k++) if (!Number.isFinite(pos[k])) nonFinite2d++;
+
   // boundary arc-length comparison and end-to-end closure
   const boundary = [];
   for (const jb of [0, nv]) {
-    let l3 = 0, l2 = 0;
+    let l3 = 0, l2 = 0, finite = true;
     for (let i = 0; i < nu; i++) {
       l3 += dist(mesh.rows[i][jb], mesh.rows[i + 1][jb]);
-      l2 += Math.hypot(get2(vid(i, jb))[0] - get2(vid(i + 1, jb))[0], get2(vid(i, jb))[1] - get2(vid(i + 1, jb))[1]);
+      const qa = get2(vid(i, jb)), qb = get2(vid(i + 1, jb));
+      if (!Number.isFinite(qa[0]) || !Number.isFinite(qa[1]) || !Number.isFinite(qb[0]) || !Number.isFinite(qb[1])) { finite = false; continue; }
+      l2 += Math.hypot(qa[0] - qb[0], qa[1] - qb[1]);
     }
-    boundary.push({ side: jb === 0 ? 'C0' : 'C1', length3: l3, length2: l2, rel: Math.abs(l2 - l3) / Math.max(1e-12, l3) });
+    boundary.push({ side: jb === 0 ? 'C0' : 'C1', length3: l3, length2: finite ? l2 : NaN, rel: finite ? Math.abs(l2 - l3) / Math.max(1e-12, l3) : Infinity });
   }
 
   // angle preservation: for each quad corner compare 3D angle to 2D angle
@@ -230,6 +274,7 @@ export function measureUnfoldError(mesh, unfold, opts = {}) {
       for (const [c, a, b] of triples) {
         const a3 = angleBetween(sub(mesh.rows[a[0]][a[1]], mesh.rows[c[0]][c[1]]), sub(mesh.rows[b[0]][b[1]], mesh.rows[c[0]][c[1]]));
         const pc = get2(vid(c[0], c[1])), pa = get2(vid(a[0], a[1])), pb = get2(vid(b[0], b[1]));
+        if (![...pc, ...pa, ...pb].every(Number.isFinite)) { maxAngleDeg = Infinity; continue; }
         const a2 = angleBetween([pa[0] - pc[0], pa[1] - pc[1], 0], [pb[0] - pc[0], pb[1] - pc[1], 0]);
         const diff = Math.abs(a3 - a2) * 180 / Math.PI;
         maxAngleDeg = Math.max(maxAngleDeg, diff);
@@ -246,10 +291,12 @@ export function measureUnfoldError(mesh, unfold, opts = {}) {
     const p = t.map((k) => mesh.rows[Math.floor(k / (nv + 1))][k % (nv + 1)]);
     const a3 = 0.5 * norm(cross(sub(p[1], p[0]), sub(p[2], p[0])));
     const q = t.map((k) => get2(k));
-    const a2 = 0.5 * Math.abs((q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[2][0] - q[0][0]) * (q[1][1] - q[0][1]));
-    const rel = Math.abs(a2 - a3) / Math.max(1e-12, a3);
-    maxAreaRel = Math.max(maxAreaRel, rel); sumAreaRel2 += rel * rel; triN++;
-    total3 += a3; total2 += a2;
+    const a2 = q.every((c) => Number.isFinite(c[0]) && Number.isFinite(c[1]))
+      ? 0.5 * Math.abs((q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[2][0] - q[0][0]) * (q[1][1] - q[0][1]))
+      : NaN;
+    const rel = Number.isFinite(a2) ? Math.abs(a2 - a3) / Math.max(1e-12, a3) : Infinity;
+    maxAreaRel = Math.max(maxAreaRel, rel); if (Number.isFinite(rel)) sumAreaRel2 += rel * rel; triN++;
+    total3 += a3; if (Number.isFinite(a2)) total2 += a2;
   }
   const rmsAreaRel = Math.sqrt(sumAreaRel2 / Math.max(1, triN));
 
@@ -257,6 +304,7 @@ export function measureUnfoldError(mesh, unfold, opts = {}) {
   let flips = 0;
   for (const t of tri.tris) {
     const q = t.map((k) => get2(k));
+    if (!q.every((c) => Number.isFinite(c[0]) && Number.isFinite(c[1]))) { flips++; continue; }
     const s = Math.sign((q[1][0] - q[0][0]) * (q[2][1] - q[0][1]) - (q[2][0] - q[0][0]) * (q[1][1] - q[0][1]));
     if (s <= 0) flips++;
   }
@@ -266,7 +314,10 @@ export function measureUnfoldError(mesh, unfold, opts = {}) {
     boundary, maxAngleDeg, rmsAngleDeg,
     maxAreaRel, rmsAreaRel, areaTotal3: total3, areaTotal2: total2, areaRel: Math.abs(total2 - total3) / Math.max(1e-12, total3),
     flips, nTris: tri.tris.length,
-    passed: maxRel < (opts.relTol ?? 1e-6) && flips === 0,
+    nonFinite2d, nonFiniteEdges: nFiniteFail,
+    // A pass requires every edge image to be finite AND within tolerance with no
+    // folded triangles. Non-finite coordinates are a hard failure, never a pass.
+    passed: nonFinite2d === 0 && nFiniteFail === 0 && maxRel < (opts.relTol ?? 1e-6) && flips === 0,
   };
 }
 

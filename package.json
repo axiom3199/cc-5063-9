@@ -5,7 +5,11 @@
   "type": "module",
   "description": "Ruled-surface developability solver, intrinsic unfolding, and papercraft tab layout prototype.",
   "scripts": {
-    "test": "node --test test/geometry.test.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "test:ui": "node --test test/ui.smoke.test.js",
     "serve": "node ui/serve.mjs"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.1"
   }
 }

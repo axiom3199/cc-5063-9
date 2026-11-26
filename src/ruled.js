@@ -129,10 +129,14 @@ export function measureDevelopability(model, opts = {}) {
     }
     // declared condition residual: |det(P0', R, R')| / (|P0'| |R| |R'|)
     // when R'~0 (parallel rulings) the condition holds identically by continuity.
+    // When L~0 (collapsed ruling) the ratio is 0/0: the condition carries no
+    // information there, so report 0 and rely on the degenerate flag rather than
+    // emitting a non-finite residual. A non-finite residual must never leak out.
     let detRes = 0;
-    if (Lp > 1e-9 * scale && Ld > 1e-12) {
+    if (L > 1e-12 * scale && Lp > 1e-9 * scale && Ld > 1e-12) {
       detRes = Math.abs(det3(f.d0, R, Rp)) / (Ld * L * Lp);
     }
+    if (L < 1e-12 * scale) degenerate = true;
     perRuling.push({ u, angle: ang, detRes, degenerate, len: L, dir: L > TINY ? mul(R, 1 / L) : [0, 0, 0] });
     if (!degenerate) {
       if (ang > maxAngle) { maxAngle = ang; maxDetU = u; }
